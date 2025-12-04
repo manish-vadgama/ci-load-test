@@ -1,0 +1,393 @@
+name: manish-vadgama
+
+on:
+  pull_request:
+    branches:
+      - main
+      - testing
+
+jobs:
+  ci-load-testing:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Install kind
+        run: |
+          curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.20.0/kind-linux-amd64
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+
+          # notes
+          # https://kind.sigs.k8s.io/docs/user/quick-start/#installing-from-release-binaries
+          # install kind from release binaries latest version
+      
+      - name: Install kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/kubectl
+          kubectl version --client
+
+          # https://kubernetes.io/docs/tasks/tools/install-kubectl-linux/#install-kubectl-binary-with-curl-on-linux
+          # install kubectl from release binaries latest version
+      
+      - name: Create kind cluster with 2 nodes
+        run: |
+          echo "🚀 Creating kind cluster with 2 nodes..."
+          cat <<EOF | kind create cluster --config=-
+          kind: Cluster
+          apiVersion: kind.x-k8s.io/v1alpha4
+          nodes:
+          - role: control-plane
+          - role: worker
+          - role: worker
+          EOF
+          if [ $? -eq 0 ]; then
+            exit 0
+          else
+            exit 1
+          fi
+
+          # notes
+          # https://raw.githubusercontent.com/kubernetes-sigs/kind/main/site/content/docs/user/kind-example-config.yaml
+          # configure mutli node cluster with 2 workers
+
+
+
+      
+      - name: Wait for cluster to be ready
+        run: |
+          echo "⏳ Waiting for all nodes to be ready..."
+          kubectl wait --for=condition=Ready nodes --all --timeout=300s
+          if [ $? -eq 0 ]; then
+            exit 0
+          else
+            exit 1
+          fi
+
+          # notes
+          # https://kubernetes.io/docs/reference/kubectl/generated/kubectl_wait/
+          # wait for all nodes to be ready before proceeding
+      
+      - name: Verify cluster status
+        run: |
+          set -e
+          echo "📊 Cluster Information:"
+          kubectl cluster-info
+          echo ""
+          echo "📋 Node Status:"
+          kubectl get nodes -o wide
+
+          # notes
+          # https://kubernetes.io/docs/reference/kubectl/generated/kubectl_cluster-info/
+          # sanity check and view cluster status
+          # sanity check and view node status
+      
+      - name: Verify cluster components
+        run: |
+          set -e
+          echo "🔍 Checking cluster components..."
+          kubectl get pods --all-namespaces
+
+          # notes
+          # sanity check and view all pods in all namespaces are running (maninily kubernetes system components)
+      
+      - name: Install NGINX Ingress Controller
+        run: |
+          set -e
+          echo "📦 Installing NGINX Ingress Controller via Helm..."
+          # Official ingress-nginx Helm chart: https://artifacthub.io/packages/helm/ingress-nginx/ingress-nginx
+          helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+          helm repo update
+          helm install ingress-nginx ingress-nginx/ingress-nginx \
+            --namespace ingress-nginx \
+            --create-namespace
+          kubectl wait --namespace ingress-nginx \
+            --for=condition=ready pod \
+            --selector=app.kubernetes.io/component=controller \
+            --timeout=300s
+
+          # notes
+          # install ingress-nginx from helm chart
+          # https://github.com/kubernetes/ingress-nginx
+          # https://artifacthub.io/packages/helm/ingress-nginx/ingress-nginx
+
+      
+      - name: Install Helm
+        run: |
+          curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+          helm version
+
+          # notes
+          # install helm from release binaries latest version
+          
+      
+      - name: Deploy http-echo chart with ingress enabled
+        run: |
+          echo "🚀 Deploying http-echo Helm chart with ingress enabled..."
+          helm install http-echo ./http-echo --set ingress.enabled=true --set ingress.className=nginx
+          if [ $? -eq 0 ]; then
+            echo "⏳ Waiting for deployments to be ready..."
+            kubectl wait --for=condition=available --timeout=300s deployment/http-echo-foo
+            kubectl wait --for=condition=available --timeout=300s deployment/http-echo-bar
+            exit 0
+          else
+            exit 1
+          fi
+
+          # notes
+          # deploy the http-echo helm chart with ingress enabled
+          # use the kubectl wait command to wait for the deployments foo and bar to be ready
+      
+      - name: Verify ingress configuration
+        run: |
+          set -e
+          kubectl get ingress
+          kubectl describe ingress http-echo
+
+          # notes
+          # verify the ingress configuration
+          # use the kubectl get and describe commands to view the ingress configuration
+      
+      
+      - name: Test hostname routing
+        run: |
+          echo "Testing hostname-based routing..."
+          
+          kubectl port-forward -n ingress-nginx service/ingress-nginx-controller 8080:80 &
+          sleep 5
+          
+          echo "Testing http://foo.localhost..."
+          FOO_RESPONSE=$(curl -s -H "Host: foo.localhost" http://localhost:8080)
+          if [ "$FOO_RESPONSE" = "foo" ]; then
+            echo "foo.localhost works"
+          else
+            echo "foo.localhost failed"
+            exit 1
+          fi
+          
+          echo "Testing http://bar.localhost..."
+          BAR_RESPONSE=$(curl -s -H "Host: bar.localhost" http://localhost:8080)
+          if [ "$BAR_RESPONSE" = "bar" ]; then
+            echo "bar.localhost works"
+            exit 0
+          else
+            echo "bar.localhost failed"
+            exit 1
+          fi
+
+          # notes
+          # test the hostname-based routing
+          # use the curl command to test the hostname-based routing after port forwarding the ingress-nginx-controller service(s) to localhost:8080
+          # use the kubectl port-forward command to port forward the ingress-nginx-controller service to localhost:8080
+          # use the kubectl get and describe commands to view the ingress configuration
+      
+      - name: Install k6 operator
+        run: |
+          echo "📦 Adding Grafana Helm repository..."
+          helm repo add grafana https://grafana.github.io/helm-charts
+          helm repo update
+          echo "🚀 Installing k6 operator..."
+          helm install k6-operator grafana/k6-operator --namespace default
+          echo "Waiting for k6 operator CRD to be installed..."
+          sleep 10
+          kubectl wait --for condition=established --timeout=60s crd/testruns.k6.io || exit 1
+          echo "Waiting for k6 operator to be ready..."
+          sleep 15
+          echo "k6 operator installation complete"
+
+          # notes
+          # install the k6 operator from the grafana helm repository
+          # use the helm install command to install the k6 operator
+          # use the kubectl wait command to wait for the k6 operator CRD to be installed
+          # use the kubectl wait command to wait for the k6 operator to be ready
+         
+
+          # We verify the k6 operator is installed and ready by checking the CRD and the operator pod is running
+          # The k6-operator is a Kubernetes controller that watches for TestRun custom resources
+          # It needs to be running BEFORE we create TestRun resources, otherwise nothing will happen
+          # Next when we create a TestRun resource, the operator automatically creates a Job to run the test
+
+          # https://github.com/grafana/k6
+          # https://artifacthub.io/packages/helm/grafana/k6-operator
+      
+      - name: Create k6 test script ConfigMap
+        run: |
+          echo "Creating k6 test script ConfigMap..."
+          kubectl create configmap k6-script --from-file=script.js=./k6-loadtest/loadtest.js || kubectl create configmap k6-script --from-file=script.js=./k6-loadtest/loadtest.js --dry-run=client -o yaml | kubectl apply -f -
+
+          # notes
+          # create a configmap with the k6 test script
+          # use the kubectl create configmap command to create the configmap
+          # use the kubectl apply command to apply the configmap
+          # the configmap is used to store the k6 test script
+          # the configmap is mounted as a volume to the k6 pod
+          # the k6 pod runs the test script
+      
+      - name: Run k6 load test
+        id: run-loadtest
+        run: |
+          echo "🔥 Running k6 load test..."
+          # Record start time for Prometheus queries
+          echo "TEST_START_TIME=$(date +%s)" >> $GITHUB_ENV
+
+          cat <<EOF | kubectl apply -f -
+          apiVersion: k6.io/v1alpha1
+          kind: TestRun
+          metadata:
+            name: loadtest
+          spec:
+            parallelism: 1
+            script:
+              configMap:
+                name: k6-script
+                file: script.js
+          EOF
+          echo "⏳ Waiting for k6 test pod to start..."
+          sleep 10
+          # Wait for the pod to be created
+          POD_NAME=""
+          for i in {1..30}; do
+            POD_NAME=$(kubectl get pods -l k6_cr=loadtest -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || kubectl get pods -l app=k6 -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+            if [ -n "$POD_NAME" ]; then
+              echo "Found k6 pod: $POD_NAME"
+              break
+            fi
+            sleep 2
+          done
+          echo "⏳ Waiting for k6 test to complete (test runs for ~5.5 minutes)..."
+          # Wait for the pod to complete - test runs for 5.5 minutes (330s), so wait up to 7 minutes
+          if [ -n "$POD_NAME" ]; then
+            kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/$POD_NAME --timeout=420s || true
+          else
+            echo "Could not find k6 pod, waiting 6 minutes for test to complete..."
+            sleep 360
+          fi
+          # Record end time
+          echo "TEST_END_TIME=$(date +%s)" >> $GITHUB_ENV
+
+          # notes
+         
+          # notes
+          # We apply a TestRun custom resource (just a YAML definition)
+          # The k6-operator controller watches for TestRun resources
+          # When it sees this TestRun resource, it automatically creates a Kubernetes Job
+          # The Job runs a k6 container with your test script
+          # The operator updates the TestRun resource status as the test runs/completes
+
+          # additonalty we run checks to ensure that the load test pod is created and the test is running
+          # we also wait for the load test pod to complete the test
+          
+      
+      - name: Extract k6 results
+        id: loadtest-results
+        run: |
+          echo "🚀  Extracting k6 results..."
+          POD_NAME=$(kubectl get pods -l k6_cr=loadtest -o jsonpath='{.items[0].metadata.name}' || kubectl get pods -l app=k6 -o jsonpath='{.items[0].metadata.name}')
+          if [ -n "$POD_NAME" ]; then
+            kubectl logs $POD_NAME > k6-results.txt
+            echo "k6 automatically collects these metrics:"
+            echo "  - http_req_duration (avg, p90, p95, etc.)"
+            echo "  - http_req_failed (failure rate)"
+            echo "  - http_reqs (requests per second)"
+            echo ""
+            echo "Sample output:"
+            tail -20 k6-results.txt
+            echo "results_file=k6-results.txt" >> $GITHUB_OUTPUT
+          else
+            echo "results_file=" >> $GITHUB_OUTPUT
+          fi
+
+          # notes
+          # extract the k6 results
+          # use the kubectl logs command to get the logs from the load test pod
+          # use the tail command to get the last 20 lines of the logs
+      
+      - name: Parse and format results
+        id: parse-results
+        run: |
+          if [ -f k6-results.txt ]; then
+            echo "📈 Parsing k6 results..."
+            
+            # Extract metrics from k6 output
+            AVG_DURATION=$(grep -oP 'http_req_duration.*avg=[0-9.]+' k6-results.txt | grep -oP 'avg=[0-9.]+' | cut -d= -f2 | head -1 || echo "N/A")
+            P90_DURATION=$(grep -oP 'http_req_duration.*p\(90\)=[0-9.]+' k6-results.txt | grep -oP 'p\(90\)=[0-9.]+' | cut -d= -f2 | head -1 || echo "N/A")
+            P95_DURATION=$(grep -oP 'http_req_duration.*p\(95\)=[0-9.]+' k6-results.txt | grep -oP 'p\(95\)=[0-9.]+' | cut -d= -f2 | head -1 || echo "N/A")
+            FAILED_RATE=$(grep -oP 'http_req_failed.*rate=[0-9.]+' k6-results.txt | grep -oP 'rate=[0-9.]+' | cut -d= -f2 | head -1 || echo "N/A")
+            REQ_RATE=$(grep -oP 'http_reqs.*rate=[0-9.]+' k6-results.txt | grep -oP 'rate=[0-9.]+' | cut -d= -f2 | head -1 || echo "N/A")
+            
+            # Convert failure rate to percentage
+            if [ "$FAILED_RATE" != "N/A" ] && [ -n "$FAILED_RATE" ]; then
+              FAIL_PERCENT=$(awk "BEGIN {printf \"%.2f\", $FAILED_RATE * 100}" || echo "0")
+            else
+              FAIL_PERCENT="0"
+            fi
+            
+            # Create markdown report
+            cat > loadtest-report.md <<EOF
+          ## 📊 Load Test Results (k6)
+          
+          ### Request Duration
+          - **Average**: ${AVG_DURATION}ms
+          - **P90**: ${P90_DURATION}ms
+          - **P95**: ${P95_DURATION}ms
+          
+          ### Request Statistics
+          - **Requests/sec**: ${REQ_RATE}
+          - **Failed Requests**: ${FAIL_PERCENT}%
+          
+          ### Full Results
+          \`\`\`
+          $(tail -50 k6-results.txt)
+          \`\`\`
+          EOF
+            
+            echo "report_file=loadtest-report.md" >> $GITHUB_OUTPUT
+          else
+            echo "report_file=" >> $GITHUB_OUTPUT
+          fi
+
+          # notes
+          # parse the k6 results
+          # use the grep command to extract the metrics from the logs
+          # use the awk command to convert the failure rate to a percentage
+          # use the cat command to create the markdown report
+          # use the echo command to create the report file
+      
+      - name: Post results as PR comment
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const reportFile = '${{ steps.parse-results.outputs.report_file }}';
+            if (reportFile && fs.existsSync(reportFile)) {
+              const report = fs.readFileSync(reportFile, 'utf8');
+              await github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: report,
+              });
+            } else {
+              console.log('No load test report generated');
+            }
+      
+      
+      - name: Cleanup kind cluster
+        if: always()
+        run: |
+          kind delete cluster || true
+
+          # notes
+          # cleanup the kind cluster
+          # use the kind delete cluster command to delete the kind cluster
+          # use the true command to continue even if the command fails
