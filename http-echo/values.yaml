@@ -1,7 +1,7 @@
 # Default image configuration
 image:
   repository: hashicorp/http-echo
-  tag: "1.0.0"
+  tag: "latest"
   pullPolicy: IfNotPresent
 
 # Default service configuration
